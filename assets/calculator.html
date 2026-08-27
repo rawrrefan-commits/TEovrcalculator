@@ -2114,7 +2114,7 @@ body{background:#f8fbff!important;}
         </div>
 
         <div class="ocr-clean-note">
-            <strong>📌 Agar OCR lebih akurat:</strong> gunakan gambar yang menampilkan angka OVR dan tabel statistik dengan cukup jelas. <b>Tidak wajib screenshot profil.</b>
+            <strong>📌 Agar OCR lebih akurat:</strong> gunakan gambar yang menampilkan angka OVR dan tabel statistik dengan cukup jelas.
             Pastikan gambar tidak blur, tidak terlalu kecil, tidak terpotong, tidak miring, dan seluruh tabel statistik terlihat jelas.
             Hindari screenshot yang sudah dikompres atau diberi filter. Semakin tajam angka OVR dan angka statistik, semakin akurat hasilnya.
             <div style="margin-top:8px;font-size:11px;line-height:1.55;opacity:.82;">
@@ -2709,6 +2709,42 @@ body{background:#f8fbff!important;}
             ctx.putImageData(data,0,0); return canvas;
         }
 
+        function tightenNumberCrop(canvas, padRatio = 0.35) {
+            // ROI OVR sengaja longgar (banyak ruang kosong) supaya posisi angka
+            // tidak gampang terpotong di berbagai ukuran layar. Tapi ruang kosong
+            // berlebihan itu justru bikin Tesseract salah baca — misalnya angka
+            // kembar seperti "55" hanya terbaca "5". Jadi sebelum dikirim ke OCR,
+            // canvas dipotong ulang pas mengikuti bounding box piksel angkanya saja.
+            const ctx=canvas.getContext("2d",{willReadFrequently:true});
+            const w=canvas.width,h=canvas.height;
+            const data=ctx.getImageData(0,0,w,h).data;
+            // Warna latar diambil dari keempat pojok (area yang hampir pasti
+            // bukan angka), lalu dicari piksel yang cukup kontras darinya.
+            const corner=(x,y)=>data[(y*w+x)*4];
+            const bg=(corner(0,0)+corner(w-1,0)+corner(0,h-1)+corner(w-1,h-1))/4;
+            let minX=w,minY=h,maxX=0,maxY=0,found=false;
+            for(let y=0;y<h;y++){
+                for(let x=0;x<w;x++){
+                    const v=data[(y*w+x)*4];
+                    if(Math.abs(v-bg)>60){
+                        found=true;
+                        if(x<minX)minX=x; if(x>maxX)maxX=x;
+                        if(y<minY)minY=y; if(y>maxY)maxY=y;
+                    }
+                }
+            }
+            if(!found) return canvas;
+            const bw=maxX-minX, bh=maxY-minY;
+            const padX=Math.max(8,Math.round(bw*padRatio));
+            const padY=Math.max(8,Math.round(bh*padRatio));
+            const sx=Math.max(0,minX-padX), sy=Math.max(0,minY-padY);
+            const ex=Math.min(w,maxX+padX), ey=Math.min(h,maxY+padY);
+            const out=document.createElement("canvas");
+            out.width=Math.max(1,ex-sx); out.height=Math.max(1,ey-sy);
+            out.getContext("2d",{willReadFrequently:true}).drawImage(canvas,sx,sy,ex-sx,ey-sy,0,0,out.width,out.height);
+            return out;
+        }
+
         async function getWorker() {
             if (ocrWorker) return ocrWorker;
             if (workerPromise) return workerPromise;
@@ -2919,9 +2955,21 @@ body{background:#f8fbff!important;}
 
             const results=[];
             for(const canvas of variants){
-                results.push(await recognizeDigits(canvas,"7"));
+                // Rapikan crop ke bounding box angka (tightenNumberCrop) lalu
+                // baca dengan PSM 8 ("single word"). PSM 7 (mode baris teks)
+                // terbukti sering gagal total di badge OVR yang latarnya gelap
+                // dengan banyak ruang kosong; PSM 8 pada crop yang sudah
+                // dirapikan jauh lebih konsisten, termasuk untuk OVR kecil
+                // dan angka kembar seperti 55.
+                const tight=tightenNumberCrop(canvas);
+                results.push(await recognizeDigits(tight,"8"));
             }
-            return bestNumber(results,50,9999);
+            // Batas bawah disamakan dengan pembacaan statistik (min=1) agar
+            // OVR kecil (di bawah 50-60) tidak lagi terbuang oleh filter.
+            // Pemilihan angka tetap lewat bestNumber() yang sudah punya bobot
+            // confidence + jumlah digit, jadi noise 1 digit tidak mengalahkan
+            // pembacaan OVR asli 2-3 digit.
+            return bestNumber(results,1,9999);
         }
 
         // Satu baris = tiga angka. Posisi bbox hasil OCR dipakai untuk menentukan kolom,
@@ -3680,4 +3728,16 @@ button:focus-visible,.ocr-btn:focus-visible,.key-gate-btn:focus-visible,.formula
     transition:background .18s ease,opacity .18s ease!important;
 }
 .preview-remove:active,.preview-remove:hover{transform:none!important;}
+</style>
+
+<style id="ocr-progress-bar-removed">
+/* Hilangkan garis progress lurus biru saat OCR berjalan.
+   Kartu spinner "Menganalisis screenshot..." (.ocr-loading) tetap tampil
+   sebagai indikator loading; hanya .ocr-progress (garis tipis di atasnya)
+   yang disembunyikan. JS tetap mengatur width-nya tanpa error karena
+   elemen tidak dihapus dari DOM, hanya disembunyikan secara visual. */
+.ocr-progress,
+.ocr-progress.show{
+    display:none!important;
+}
 </style>
