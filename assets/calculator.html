@@ -2886,21 +2886,181 @@ body{background:#f8fbff!important;}
             return scored[0].n;
         }
 
+        /*
+         * Bonus statistik "+NN" (mis. "96 +40", "43 +40").
+         * Fungsi murni: menerima pixel RGBA sebuah cell/crop angka, lalu mencari
+         * posisi X tempat bonus "+NN" mulai. Bila tidak ada bonus -> null, dan
+         * canvas TIDAK diubah sama sekali (jalur OCR normal tetap identik).
+         */
+        function detectStatBonusRegion(d,w,h,xyRatio){
+            xyRatio=xyRatio||1; // rasio skala X/Y saat crop di-resize (agar bentuk "+" tetap dikenali)
+            const n=w*h;
+            const gray=new Float32Array(n), sat=new Uint8Array(n);
+            const hist=new Uint32Array(256);
+            for(let i=0,p=0;i<n;i++,p+=4){
+                const r=d[p],g=d[p+1],b=d[p+2];
+                const gy=r*.299+g*.587+b*.114;
+                gray[i]=gy; sat[i]=Math.max(r,g,b)-Math.min(r,g,b);
+                hist[Math.max(0,Math.min(255,Math.round(gy)))]++;
+            }
+            let acc=0,bg=255;
+            for(let v=0;v<256;v++){acc+=hist[v]; if(acc>=n/2){bg=v;break;}}
+
+            const text=new Uint8Array(n), colored=new Uint8Array(n);
+            let coloredCount=0;
+            for(let i=0;i<n;i++){
+                if(sat[i]>=55){colored[i]=1;coloredCount++;}
+                else if(Math.abs(gray[i]-bg)>=60) text[i]=1;
+            }
+            // Latar yang sangat berwarna = layout tak dikenal -> jangan sentuh apa pun.
+            if(coloredCount>n*0.35) return null;
+
+            const y0=2,y1=h-3;
+            const colInk=new Uint16Array(w);
+            for(let y=y0;y<=y1;y++) for(let x=0;x<w;x++) if(text[y*w+x]) colInk[x]++;
+
+            // Segmentasi glyph berdasarkan kolom yang berisi tinta.
+            let runs=[],start=-1;
+            for(let x=0;x<=w;x++){
+                const on=x<w && colInk[x]>=2;
+                if(on && start<0) start=x;
+                if(!on && start>=0){
+                    let ya=h,yb=-1;
+                    for(let y=y0;y<=y1;y++) for(let xx=start;xx<x;xx++) if(text[y*w+xx]){if(y<ya)ya=y;if(y>yb)yb=y;}
+                    runs.push({x0:start,x1:x-1,y0:ya,y1:yb,w:x-start,h:yb-ya+1});
+                    start=-1;
+                }
+            }
+            runs=runs.filter(r=>r.w>=2 && r.h<=h*0.9);
+            if(runs.length<2) return null;
+            const maxH=Math.max(...runs.map(r=>r.h));
+            runs=runs.filter(r=>r.h>=maxH*0.2);
+            if(runs.length<2) return null;
+
+            // Tepi kanan badge (area berwarna ungu) bila ada.
+            let badgeX0=-1,badgeX1=-1;
+            for(let x=0;x<w;x++){
+                let c=0; for(let y=y0;y<=y1;y++) if(colored[y*w+x]) c++;
+                if(c>=3){ if(badgeX0<0) badgeX0=x; badgeX1=x; }
+            }
+            const hasBadge=badgeX1>=0 && (badgeX1-badgeX0)>=maxH*0.6;
+
+            const inkIn=(r,fx0,fx1,fy0,fy1)=>{
+                const xa=r.x0+Math.floor(r.w*fx0), xb=r.x0+Math.max(Math.floor(r.w*fx1)-1,Math.floor(r.w*fx0));
+                const ya=r.y0+Math.floor(r.h*fy0), yb=r.y0+Math.max(Math.floor(r.h*fy1)-1,Math.floor(r.h*fy0));
+                let on=0,tot=0;
+                for(let y=ya;y<=yb;y++) for(let x=xa;x<=xb;x++){tot++; if(text[y*w+x]) on++;}
+                return tot?on/tot:0;
+            };
+            const isPlus=r=>{
+                if(r.h>maxH*0.82) return false;
+                const ar=(r.w/xyRatio)/r.h;
+                if(ar<0.8||ar>1.4) return false;
+                const corners=(inkIn(r,0,.3,0,.3)+inkIn(r,.7,1,0,.3)+inkIn(r,0,.3,.7,1)+inkIn(r,.7,1,.7,1))/4;
+                const center=inkIn(r,.35,.65,.35,.65);
+                const arms=Math.min(inkIn(r,0,.3,.4,.6),inkIn(r,.7,1,.4,.6),inkIn(r,.4,.6,0,.3),inkIn(r,.4,.6,.7,1));
+                return corners<0.22 && center>0.75 && arms>0.45;
+            };
+
+            const digitsCy=(()=>{
+                const t=runs.filter(r=>r.h>=maxH*0.85).map(r=>(r.y0+r.y1)/2).sort((a,b)=>a-b);
+                return t.length?t[Math.floor(t.length/2)]:h/2;
+            })();
+
+            let cutX=-1;
+            // Jalur 1 (utama): cari tanda "+" lewat bentuknya.
+            for(let i=1;i<runs.length;i++){
+                const r=runs[i];
+                if(hasBadge && r.x0<=badgeX1) continue;
+                if(Math.abs((r.y0+r.y1)/2-digitsCy)>maxH*0.18) continue;
+                if(!isPlus(r)) continue;
+                // Harus ada angka utama di kiri tanda "+".
+                const leftDigits=runs.filter(q=>q.x1<r.x0 && q.h>=maxH*0.85 && (!hasBadge||q.x0>badgeX1));
+                if(!leftDigits.length) continue;
+                cutX=r.x0-2; break;
+            }
+            // Jalur 2 (cadangan): ada badge bonus + kata kedua setelah angka utama.
+            if(cutX<0 && hasBadge){
+                const after=runs.filter(r=>r.x0>badgeX1 && r.h>=maxH*0.5);
+                if(after.length>=2){
+                    const gapMin=maxH*0.38;
+                    for(let i=1;i<after.length;i++){
+                        if(after[i].x0-after[i-1].x1>gapMin){cutX=after[i].x0-2;break;}
+                    }
+                }
+            }
+            if(cutX<=0) return null;
+
+            // Pastikan masih ada angka utama di kiri titik potong.
+            const main=runs.filter(r=>r.x1<cutX && r.h>=maxH*0.5 && (!hasBadge||r.x0>badgeX1));
+            if(!main.length) return null;
+            const firstMainX=Math.min(...main.map(r=>r.x0));
+            return {
+                cutX,
+                badgeX1: (hasBadge && badgeX1+3<firstMainX) ? badgeX1+3 : -1,
+                bg
+            };
+        }
+
+        function stripStatBonus(canvas, xyRatio) {
+            // Hapus bagian bonus "+NN" (dan ikon badge ungu) dari crop angka SEBELUM
+            // dibaca OCR, sehingga "96 +40" hanya menyisakan "96".
+            // Jika tidak ada bonus -> canvas dikembalikan apa adanya (tidak diubah).
+            const w=canvas.width,h=canvas.height;
+            const ctx=canvas.getContext("2d",{willReadFrequently:true});
+            const img=ctx.getImageData(0,0,w,h), d=img.data;
+            const info=detectStatBonusRegion(d,w,h,xyRatio);
+            if(!info) return canvas;
+            // Warna latar asli cell (rata-rata piksel latar) agar area yang dihapus menyatu.
+            let R=0,G=0,B=0,N=0;
+            for(let i=0;i<d.length;i+=4){
+                const r=d[i],g=d[i+1],b=d[i+2];
+                const gy=r*.299+g*.587+b*.114;
+                if(Math.abs(gy-info.bg)<=20 && (Math.max(r,g,b)-Math.min(r,g,b))<40){R+=r;G+=g;B+=b;N++;}
+            }
+            if(!N) return canvas;
+            ctx.fillStyle="rgb("+Math.round(R/N)+","+Math.round(G/N)+","+Math.round(B/N)+")";
+            ctx.fillRect(info.cutX,0,w-info.cutX,h);
+            if(info.badgeX1>0) ctx.fillRect(0,0,info.badgeX1,h);
+            return canvas;
+        }
+
         // Crop khusus angka: jauh lebih sempit daripada cell penuh sehingga
         // label statistik tidak ikut mengganggu pembacaan digit.
         function makeNumberCanvas(img,row,col) {
-            const panel=cropRelative(img,0.302,0.495,0.839,0.803,1);
-            const w=panel.width,h=panel.height,colW=w/3,rowH=h/5;
+            const px=Math.round(img.width*0.302), py=Math.round(img.height*0.495);
+            const w=Math.max(1,Math.round(img.width*(0.839-0.302))), h=Math.max(1,Math.round(img.height*(0.803-0.495)));
+            const colW=w/3,rowH=h/5;
             const x=Math.round(col*colW+colW*0.68);
-            const y=Math.round(row*rowH+rowH*0.08);
-            const cw=Math.round(colW*0.30), ch=Math.round(rowH*0.84);
+            // Mulai sedikit DI ATAS baris (bukan +0.08) supaya garis atas angka 7
+            // di baris pertama tidak terpotong dan terbaca "1". Batas bawah tetap sama.
+            const y=Math.max(-py,Math.round(row*rowH-rowH*0.06));
+            const cw=Math.round(colW*0.30), ch=Math.round(rowH*0.98);
             const out=document.createElement("canvas");
             out.width=420; out.height=110;
             const ctx=out.getContext("2d",{willReadFrequently:true});
             ctx.fillStyle="#fff"; ctx.fillRect(0,0,out.width,out.height);
             ctx.imageSmoothingEnabled=true;
-            ctx.drawImage(panel,x,y,cw,ch,0,0,out.width,out.height);
+            ctx.drawImage(img,px+x,py+y,cw,ch,0,0,out.width,out.height);
+            stripStatBonus(out,(out.width/cw)/(out.height/ch));
             return out;
+        }
+
+        function inkTouchesTop(canvas,rows=7) {
+            // True bila ada tinta (angka) menempel di tepi atas crop -> angka berisiko terpotong.
+            const w=canvas.width,h=canvas.height;
+            const d=canvas.getContext("2d",{willReadFrequently:true}).getImageData(0,0,w,h).data;
+            const n=w*h, hist=new Uint32Array(256);
+            for(let i=0,p=0;i<n;i++,p+=4) hist[Math.max(0,Math.min(255,Math.round(d[p]*.299+d[p+1]*.587+d[p+2]*.114)))]++;
+            let acc=0,bg=255;
+            for(let v=0;v<256;v++){acc+=hist[v]; if(acc>=n/2){bg=v;break;}}
+            for(let y=0;y<Math.min(rows,h);y++){
+                for(let x=0;x<w;x++){
+                    const p=(y*w+x)*4,r=d[p],g=d[p+1],b=d[p+2];
+                    if((Math.max(r,g,b)-Math.min(r,g,b))<55 && Math.abs(r*.299+g*.587+b*.114-bg)>=60) return true;
+                }
+            }
+            return false;
         }
 
         function sharpenCanvas(canvas) {
@@ -2995,19 +3155,32 @@ body{background:#f8fbff!important;}
         }
 
         function makeCellCanvas(img,row,col) {
-            const panel=cropRelative(img,0.302,0.495,0.839,0.803,1);
-            const w=panel.width,h=panel.height,colW=w/3,rowH=h/5;
+            const px=Math.round(img.width*0.302), py=Math.round(img.height*0.495);
+            const w=Math.max(1,Math.round(img.width*(0.839-0.302))), h=Math.max(1,Math.round(img.height*(0.803-0.495)));
+            const colW=w/3,rowH=h/5;
             // Angka berada di sisi kanan tiap cell. Crop dibuat sedikit
             // lebih fokus ke area angka agar digit kedua (mis. 71) tidak
             // hilang akibat teks label/background.
-            // Fokus pada angka atribut utama. Bonus latihan seperti "96 +40"
-            // berada di sisi kanan; batasi crop sebelum area bonus agar +40
-            // tidak ikut terbaca atau tergabung menjadi 9640.
             const x=Math.round(col*colW+colW*0.52), y=Math.round(row*rowH+rowH*0.01);
-            const cw=Math.round(colW*0.34), ch=Math.round(rowH*0.98);
+            const cw=Math.round(colW*0.46);
+            let ch=Math.round(rowH*0.98);
             const out=document.createElement("canvas"); out.width=300; out.height=90;
-            const o=out.getContext("2d",{willReadFrequently:true}); o.fillStyle="#fff"; o.fillRect(0,0,300,90);
-            o.imageSmoothingEnabled=true; o.drawImage(panel,x,y,cw,ch,0,0,300,90);
+            const o=out.getContext("2d",{willReadFrequently:true});
+            const paint=(yy,hh)=>{
+                o.fillStyle="#fff"; o.fillRect(0,0,300,90);
+                o.imageSmoothingEnabled=true; o.drawImage(img,px+x,py+yy,cw,hh,0,0,300,90);
+            };
+            paint(y,ch);
+            // Baris paling atas biasanya mepet ke tepi atas crop, sehingga garis atas
+            // angka 7 hampir terpotong dan terbaca "1" (71 -> 1). Jika ada tinta yang
+            // menempel di tepi atas, tambahkan sedikit margin di atas. Cell yang
+            // sudah punya margin cukup TIDAK diubah sama sekali.
+            if(inkTouchesTop(out)){
+                const ext=Math.min(Math.round(rowH*0.14),py+y);
+                if(ext>0){ paint(y-ext,ch+ext); ch+=ext; }
+            }
+            // Buang bonus "+NN" (mis. 96 +40 -> 96) sebelum preprocessing & OCR.
+            stripStatBonus(out,(300/cw)/(90/ch));
             prepareGray(out,1.18); normalizeCanvas(out);
             return out;
         }
@@ -3048,12 +3221,32 @@ body{background:#f8fbff!important;}
         async function recognizeAdaptiveWords(canvas) {
             const worker = await getWorker();
             await worker.setParameters({
-                tessedit_char_whitelist:"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 ",
+                tessedit_char_whitelist:"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+ ",
                 tessedit_pageseg_mode:"11",
                 preserve_interword_spaces:"1"
             });
             const result = await worker.recognize(canvas);
             return result?.data || {text:"", confidence:0, words:[]};
+        }
+
+        function adaptiveDropBonusWords(words){
+            // Fallback adaptif: buang bonus "+NN" (mis. "+40") agar hanya angka utama yang dibaca.
+            const out=[];
+            for(let i=0;i<words.length;i++){
+                const w=words[i], t=String(w.text||"").trim();
+                if(t.includes("+")){
+                    const lead=t.split("+")[0];
+                    if(/\d/.test(lead)) out.push({...w,text:lead});
+                    continue;
+                }
+                const prev=words[i-1];
+                if(prev && String(prev.text||"").trim()==="+" && /\d/.test(t)){
+                    const h=Math.max(6,(w.y1-w.y0));
+                    if(w.x0-prev.x1<=h*2) continue;
+                }
+                out.push(w);
+            }
+            return out;
         }
 
         function adaptiveWordLines(words) {
@@ -3084,7 +3277,10 @@ body{background:#f8fbff!important;}
                 best.words.push(word);
                 best.height=Math.max(best.height,h);
             }
-            lines.forEach(line=>line.words.sort((a,b)=>a.x0-b.x0));
+            lines.forEach(line=>{
+                line.words.sort((a,b)=>a.x0-b.x0);
+                line.words=adaptiveDropBonusWords(line.words);
+            });
             return lines;
         }
 
@@ -3095,26 +3291,16 @@ body{background:#f8fbff!important;}
         function adaptiveNumberCandidates(words, afterX){
             return words
                 .filter(w => w.x0 >= afterX - 2)
-                .map((w,index,arr) => {
-                    const original=String(w.text || "").trim();
-                    // Bonus latihan seperti +40 bukan nilai dasar. Abaikan baik
-                    // ketika tanda + menempel pada angka maupun terbaca sebagai token terpisah.
-                    if(/^\+\s*\d/.test(original)) return null;
-                    const previous=arr[index-1];
-                    if(previous && /^\+\s*$/.test(String(previous.text||"").trim())) return null;
-
-                    const raw=original.replace(/[Oo]/g,"0").replace(/[Il|]/g,"1").replace(/S/g,"5");
-                    // Jika OCR menggabungkan "96+40" menjadi satu token, ambil
-                    // angka sebelum tanda +, bukan menggabungkannya menjadi 9640.
-                    const beforeBonus=raw.match(/^(\d{1,3})\s*\+\s*\d+/);
-                    const m=beforeBonus ? [beforeBonus[0],beforeBonus[1]] : raw.match(/\d{1,4}/);
+                .map(w => {
+                    const raw=String(w.text || "").replace(/[Oo]/g,"0").replace(/[Il|]/g,"1").replace(/S/g,"5");
+                    const m=raw.match(/\d{1,4}/);
                     if(!m) return null;
-                    const n=Number(m[1]);
+                    const n=Number(m[0]);
                     if(n<1 || n>9999) return null;
                     return {
                         n,
                         conf:w.conf,
-                        digits:m[1].length,
+                        digits:m[0].length,
                         x0:w.x0,
                         y0:w.y0
                     };
@@ -3144,15 +3330,12 @@ body{background:#f8fbff!important;}
                 }
 
                 const nums=adaptiveNumberCandidates(words, anchorX);
-                // Dalam baris statistik Top Eleven, angka atribut utama muncul
-                // lebih dulu dari bonus latihan di sebelah kanannya. Pilih angka
-                // terdekat setelah label; confidence tetap dipakai sebagai tie-breaker
-                // agar +40 tidak menang hanya karena OCR membacanya lebih jelas.
-                if(nums.length){
-                    nums.sort((a,b)=>a.x0-b.x0 || b.digits-a.digits || b.conf-a.conf);
-                    const c=nums[0];
+                for(const c of nums){
+                    // Angka yang sangat pendek diprioritaskan hanya jika tidak ada
+                    // angka 2-4 digit pada baris yang sama.
                     let score=c.conf*0.45 + c.digits*28;
                     if(c.digits>=3) score+=35;
+                    if(c.x0>anchorX) score+=10;
                     candidates.push({...c,score});
                 }
             }
@@ -3418,12 +3601,8 @@ body{background:#f8fbff!important;}
                         finalType=adaptive.playerType;
                         finalOrder=adaptive.statOrder;
                     }else{
-                        // Hasil adaptif yang cocok dengan label statistik juga
-                        // boleh mengoreksi nilai hasil crop jika angka bonus (+40,
-                        // +30, dst.) sempat tergabung di OCR crop. Parser adaptif
-                        // memilih angka utama pertama setelah label, bukan bonus.
                         for(const [name,value] of Object.entries(adaptive.stats)){
-                            finalStats[name]=value;
+                            if(finalStats[name]===undefined) finalStats[name]=value;
                         }
                     }
                 }
